@@ -9,8 +9,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code and ensure readable by all users
 COPY proxy/ ./proxy/
+RUN chmod -R a+rX ./proxy/
 
 # Non-root user for security
 RUN useradd --create-home --shell /sbin/nologin proxyuser
