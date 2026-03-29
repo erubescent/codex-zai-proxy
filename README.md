@@ -25,23 +25,44 @@ Codex CLI (`@openai/codex`) removed support for `wire_api = "chat"` and now requ
 
 ## Requirements
 
-- [Podman](https://podman.io/) (rootless)
+- **Docker** (with Compose plugin) or **Podman** — detected automatically
 - [Codex CLI](https://github.com/openai/codex) (`npm install -g @openai/codex`)
 - Z.ai GLM Coding Plan subscription with API key
 
-## Quick Start
+## Quick Start (Recommended)
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USERNAME/codex-zai-proxy.git
+git clone https://github.com/erubescent/codex-zai-proxy.git
 cd codex-zai-proxy
 
+# Set your API key and run setup
+export ZAI_API_KEY="your-key-here"    # bash
+# set -x ZAI_API_KEY "your-key-here"  # fish
+
+./setup.sh
+```
+
+`setup.sh` automatically detects Docker or Podman, builds the container, starts it, and configures Codex CLI. It also persists your API key to the correct shell config file.
+
+## Manual Setup
+
+<details>
+<summary>Click to expand manual instructions</summary>
+
+```bash
 # Configure your API key
 cp .env.example .env
 # Edit .env and set ZAI_API_KEY=your-key-here
 chmod 600 .env
 
-# Build and start
+# With Docker Compose
+docker compose up -d --build
+
+# With Podman Compose
+podman compose up -d --build
+
+# Or with Podman directly (no compose)
 podman build -t codex-zai-proxy .
 podman run -d \
   --name codex-zai-proxy \
@@ -57,6 +78,8 @@ podman run -d \
 # Verify
 curl http://127.0.0.1:4891/health
 ```
+
+</details>
 
 ## Codex Configuration
 
