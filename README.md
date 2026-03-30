@@ -63,7 +63,7 @@ curl http://127.0.0.1:4891/health
 Add this to `~/.codex/config.toml`:
 
 ```toml
-profile = "glm_5_1_proxy"
+profile = "glm_proxy"
 
 [model_providers.z_ai_proxy]
 name = "z.ai via Local Proxy"
@@ -71,10 +71,12 @@ base_url = "http://127.0.0.1:4891/v1"
 env_key = "ZAI_API_KEY"
 wire_api = "responses"
 
-[profiles.glm_5_1_proxy]
+[profiles.glm_proxy]
 model = "glm-5.1"
 model_provider = "z_ai_proxy"
 ```
+
+To switch models, change the `model` value in your profile (e.g. `"glm-5"`, `"glm-4.7"`). The proxy passes through whatever model Codex requests — no proxy restart needed. Just start a new Codex session.
 
 Make sure `ZAI_API_KEY` is set in your shell environment, then run:
 

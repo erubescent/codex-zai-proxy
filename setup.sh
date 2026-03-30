@@ -101,7 +101,7 @@ if command -v codex &>/dev/null; then
         ok "Codex already configured"
     else
         cat > "$CFG" <<'TOML'
-profile = "glm_5_1_proxy"
+profile = "glm_proxy"
 
 [model_providers.z_ai_proxy]
 name = "z.ai via Local Proxy"
@@ -109,7 +109,7 @@ base_url = "http://127.0.0.1:4891/v1"
 env_key = "ZAI_API_KEY"
 wire_api = "responses"
 
-[profiles.glm_5_1_proxy]
+[profiles.glm_proxy]
 model = "glm-5.1"
 model_provider = "z_ai_proxy"
 TOML

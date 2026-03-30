@@ -33,6 +33,12 @@ ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
 PROXY_PORT = int(os.getenv("PROXY_PORT", "4891"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# Known Z.ai models for /v1/models endpoint
+ZAI_MODELS = ["glm-5", "glm-5.1", "glm-4.7"]
+
+# Loop detection: max identical consecutive chunks before breaking
+LOOP_REPEAT_LIMIT = 5
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -48,7 +54,7 @@ log = logging.getLogger("codex-zai-proxy")
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Codex-Z.ai Proxy", version="1.0.0")
+app = FastAPI(title="Codex-Z.ai Proxy", version="1.1.0")
 
 # Shared httpx client (connection pooling)
 _http_client: httpx.AsyncClient | None = None
@@ -94,6 +100,27 @@ def _now() -> int:
     return int(time.time())
 
 
+def _validate_and_fix_json(args_str: str, tool_name: str) -> str:
+    """Validate tool call arguments are valid JSON, attempt fix if not."""
+    try:
+        json.loads(args_str)
+        return args_str
+    except json.JSONDecodeError as e:
+        log.warning("Invalid tool call arguments for %s: %s, attempting fix", tool_name, e)
+        fixed = args_str.rstrip()
+        open_braces = fixed.count('{') - fixed.count('}')
+        open_brackets = fixed.count('[') - fixed.count(']')
+        fixed += '}' * max(0, open_braces) + ']' * max(0, open_brackets)
+        try:
+            json.loads(fixed)
+            log.info("Fixed arguments for %s: added %d braces, %d brackets",
+                     tool_name, max(0, open_braces), max(0, open_brackets))
+            return fixed
+        except json.JSONDecodeError:
+            log.error("Could not fix arguments for %s, returning empty object", tool_name)
+            return "{}"
+
+
 # ===================================================================
 # Request translation: Responses API -> Chat Completions
 # ===================================================================
@@ -129,11 +156,9 @@ def _translate_tools(tools: list[dict]) -> list[dict]:
     for tool in tools:
         ttype = tool.get("type", "function")
         if ttype == "function":
-            # If already has nested "function" key, pass through
             if "function" in tool:
                 chat_tools.append(tool)
             else:
-                # Wrap name/description/parameters in "function" key
                 fn_obj = {}
                 if "name" in tool:
                     fn_obj["name"] = tool["name"]
@@ -144,23 +169,27 @@ def _translate_tools(tools: list[dict]) -> list[dict]:
                 if "strict" in tool:
                     fn_obj["strict"] = tool["strict"]
                 chat_tools.append({"type": "function", "function": fn_obj})
-        # Skip built-in tool types (web_search, etc.) that Z.ai won't understand
     return chat_tools
 
 
 def translate_request(body: dict[str, Any]) -> dict[str, Any]:
     """
     Convert a Responses API request body into a Chat Completions API request body.
+
+    KEY FIX: Consolidates ALL system-level content (instructions + developer role
+    messages) into a single system message at position 0. This prevents GLM models
+    from getting confused by multiple system messages scattered mid-conversation,
+    which was the primary cause of infinite planning loops.
     """
     messages: list[dict[str, Any]] = []
+    system_parts: list[str] = []
 
-    # 1. System prompt from "instructions"
+    # 1. Collect system prompt from "instructions"
     instructions = body.get("instructions")
     if instructions:
-        messages.append({"role": "system", "content": instructions})
+        system_parts.append(instructions)
 
     # 2. Walk input items and build messages
-    # We track the last assistant message to accumulate tool_calls into it.
     last_assistant_idx: int | None = None
 
     def _ensure_assistant() -> int:
@@ -183,15 +212,19 @@ def translate_request(body: dict[str, Any]) -> dict[str, Any]:
 
         if itype == "message":
             role = item.get("role", "user")
-            # Map developer -> system for Z.ai compatibility
-            if role == "developer":
-                role = "system"
             content = _extract_text(item.get("content"))
+
+            if role == "developer":
+                # FIX: Collect developer directives into system_parts instead
+                # of creating mid-conversation system messages that confuse GLM
+                if content:
+                    system_parts.append(content)
+                continue
+
             messages.append({"role": role, "content": content})
             if role == "assistant":
                 last_assistant_idx = len(messages) - 1
             elif role == "system":
-                # system messages don't affect the assistant tracking
                 pass
             else:
                 last_assistant_idx = None
@@ -222,12 +255,9 @@ def translate_request(body: dict[str, Any]) -> dict[str, Any]:
             last_assistant_idx = None
 
         elif itype in ("local_shell_call", "custom_tool_call", "tool_search_call"):
-            # These are OpenAI-specific tool call types.
-            # Convert to function_call format for Z.ai.
             action = item.get("action", {})
             call_id = item.get("call_id", _call_id())
 
-            # Determine a function name
             name = action.get("type", itype)
             if itype == "local_shell_call":
                 name = "shell"
@@ -247,11 +277,25 @@ def translate_request(body: dict[str, Any]) -> dict[str, Any]:
             messages[idx]["tool_calls"].append(tc)
 
         elif itype == "reasoning":
-            # Z.ai doesn't have a direct equivalent; skip reasoning items
-            pass
+            # FIX: Preserve reasoning context so GLM doesn't re-analyze
+            reasoning_text = _extract_text(item.get("summary", item.get("content", "")))
+            if reasoning_text:
+                log.debug("Dropping reasoning item (%d chars): %s", len(reasoning_text), reasoning_text[:200])
+                summary = reasoning_text[:500]
+                messages.append({
+                    "role": "assistant",
+                    "content": f"[Previous reasoning: {summary}]",
+                })
+                last_assistant_idx = len(messages) - 1
+            else:
+                log.debug("Dropping empty reasoning item")
 
         else:
             log.debug("Skipping unknown input item type: %s", itype)
+
+    # FIX: Consolidate all system content into ONE system message at position 0
+    if system_parts:
+        messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
 
     # 3. Build the chat completions request
     chat_req: dict[str, Any] = {
@@ -265,6 +309,10 @@ def translate_request(body: dict[str, Any]) -> dict[str, Any]:
         if key in body:
             chat_req[key] = body[key]
 
+    # Map Responses API max_output_tokens -> Chat Completions max_completion_tokens
+    if "max_output_tokens" in body and "max_completion_tokens" not in body:
+        chat_req["max_completion_tokens"] = body["max_output_tokens"]
+
     # Translate tools
     tools = body.get("tools")
     if tools:
@@ -275,7 +323,11 @@ def translate_request(body: dict[str, Any]) -> dict[str, Any]:
             if body.get("parallel_tool_calls") is not None:
                 chat_req["parallel_tool_calls"] = body["parallel_tool_calls"]
 
-    log.info("Translated request: %d messages, model=%s", len(messages), chat_req["model"])
+    log.info("Translated request: %d messages, model=%s, system_parts=%d",
+             len(messages), chat_req["model"], len(system_parts))
+    log.debug("Translated messages: %s", json.dumps(messages[:3], default=str)[:2000])
+    if chat_req.get("tools"):
+        log.debug("Tools: %s", [t.get("function", {}).get("name", "?") for t in chat_req.get("tools", [])])
     return chat_req
 
 
@@ -310,15 +362,18 @@ async def translate_stream(
     output_index = 0
     text_started = False
     full_text = ""
-    tool_calls_map: dict[int, dict[str, Any]] = {}  # index -> {call_id, name, arguments}
+    tool_calls_map: dict[int, dict[str, Any]] = {}
     usage_info: dict[str, Any] = {}
+    last_content = ""
+    repeat_count = 0
+    chunk_count = 0
+    loop_broken = False
 
     async for line in upstream.aiter_lines():
         if not line:
             continue
 
         if not line.startswith("data: "):
-            # Could be comment lines or event: lines from upstream; skip
             continue
 
         payload = line[6:]
@@ -342,8 +397,27 @@ async def translate_stream(
             # -- Handle text content --
             content = delta.get("content")
             if content is not None and content != "":
+                chunk_count += 1
+                if content == last_content:
+                    repeat_count += 1
+                    if repeat_count >= LOOP_REPEAT_LIMIT:
+                        log.warning("Loop detected (%d repeats), breaking: %s",
+                                    repeat_count, content[:100])
+                        # Emit corrective text and break
+                        if text_started:
+                            yield _sse("response.output_text.delta", {
+                                "type": "response.output_text.delta",
+                                "output_index": output_index,
+                                "content_index": 0,
+                                "delta": "\n\n[Loop detected - stopping repetitive output.]",
+                            })
+                        loop_broken = True
+                        break
+                else:
+                    repeat_count = 0
+                last_content = content
+
                 if not text_started:
-                    # Emit output_item.added for the message
                     yield _sse("response.output_item.added", {
                         "type": "response.output_item.added",
                         "output_index": output_index,
@@ -372,8 +446,6 @@ async def translate_stream(
                     tc_index = tc.get("index", 0)
 
                     if tc_index not in tool_calls_map:
-                        # New tool call starting
-                        # If we were streaming text, close that message first
                         if text_started:
                             yield _sse("response.output_item.done", {
                                 "type": "response.output_item.done",
@@ -418,14 +490,12 @@ async def translate_stream(
                         })
                         output_index += 1
                     else:
-                        # Accumulate arguments
                         fn = tc.get("function", {})
                         if fn and fn.get("arguments"):
                             tool_calls_map[tc_index]["arguments"] += fn["arguments"]
 
             # -- Handle finish --
             if finish_reason:
-                # Close text message if still open
                 if text_started:
                     yield _sse("response.output_item.done", {
                         "type": "response.output_item.done",
@@ -444,9 +514,10 @@ async def translate_stream(
                     text_started = False
                     full_text = ""
 
-                # Close all tool call items
+                # Close all tool call items with validated arguments
                 for idx in sorted(tool_calls_map.keys()):
                     tc = tool_calls_map[idx]
+                    validated_args = _validate_and_fix_json(tc["arguments"], tc["name"])
                     yield _sse("response.output_item.done", {
                         "type": "response.output_item.done",
                         "output_index": tc["output_index"],
@@ -455,10 +526,13 @@ async def translate_stream(
                             "id": tc["call_id"],
                             "call_id": tc["call_id"],
                             "name": tc["name"],
-                            "arguments": tc["arguments"],
+                            "arguments": validated_args,
                             "status": "completed",
                         },
                     })
+
+        if loop_broken:
+            break
 
     # -- Final: response.completed --
     resp_usage = {
@@ -466,6 +540,9 @@ async def translate_stream(
         "output_tokens": usage_info.get("completion_tokens", 0),
         "total_tokens": usage_info.get("total_tokens", 0),
     }
+
+    log.info("Response complete: %d chunks, %d chars text, %d tool calls, loop_broken=%s",
+             chunk_count, len(full_text), len(tool_calls_map), loop_broken)
 
     yield _sse("response.completed", {
         "type": "response.completed",
@@ -562,7 +639,6 @@ async def create_response(request: Request):
     if upstream.status_code != 200:
         error_body = await upstream.aread()
         log.error("Upstream error %d: %s", upstream.status_code, error_body[:500])
-        # Return a Responses API error
         return Response(
             content=json.dumps({
                 "error": {
@@ -589,16 +665,17 @@ async def create_response(request: Request):
 
 @app.get("/v1/models")
 async def list_models():
-    """Minimal models endpoint for Codex compatibility."""
+    """Models endpoint for Codex compatibility. Returns known Z.ai models."""
     return {
         "object": "list",
         "data": [
             {
-                "id": "glm-5.1",
+                "id": m,
                 "object": "model",
                 "created": _now(),
                 "owned_by": "z.ai",
             }
+            for m in ZAI_MODELS
         ],
     }
 
