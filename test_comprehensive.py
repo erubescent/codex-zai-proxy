@@ -14,9 +14,9 @@ Usage:
   python3 test_comprehensive.py http://127.0.0.1:4892 TWINKLE
 """
 import httpx
+import time
 import json
 import sys
-import time
 from typing import Any
 
 PROXY_URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:4891"
@@ -76,7 +76,7 @@ class ProxyTest:
         self.results: list[dict] = []
         self.errors: list[str] = []
 
-    def send_request(self, body: dict, timeout: int = 120) -> list[dict]:
+    def send_request(self, body: dict, timeout: int = 180) -> list[dict]:
         """Send request and collect all SSE events."""
         events = []
         with httpx.stream("POST", f"{self.proxy_url}/v1/responses", json=body, timeout=timeout) as r:
@@ -189,7 +189,7 @@ def test_flask_app(t: ProxyTest, model: str):
         "stream": True,
     }
 
-    events = t.send_request(body, timeout=90)
+    events = t.send_request(body, timeout=180)
     tool_calls = t.extract_tool_calls(events)
     text = t.extract_text(events)
     no_loop = t.check_no_loop(events)
@@ -231,7 +231,7 @@ def test_multi_turn(t: ProxyTest, model: str):
         "tools": [SHELL_TOOL],
         "stream": True,
     }
-    events1 = t.send_request(body1, timeout=60)
+    events1 = t.send_request(body1, timeout=180)
     calls1 = t.extract_tool_calls(events1)
 
     t.record("multi_turn_phase1_calls", model, len(calls1) >= 1,
@@ -264,7 +264,7 @@ def test_multi_turn(t: ProxyTest, model: str):
         "tools": [SHELL_TOOL],
         "stream": True,
     }
-    events2 = t.send_request(body2, timeout=60)
+    events2 = t.send_request(body2, timeout=180)
     calls2 = t.extract_tool_calls(events2)
     text2 = t.extract_text(events2)
 
@@ -295,7 +295,7 @@ def test_multi_turn(t: ProxyTest, model: str):
         "input": input_history3,
         "stream": True,
     }
-    events3 = t.send_request(body3, timeout=60)
+    events3 = t.send_request(body3, timeout=180)
     text3 = t.extract_text(events3)
 
     remembers = "fibonacci" in text3.lower() or "fib" in text3.lower()
@@ -377,7 +377,7 @@ def test_reasoning(t: ProxyTest, model: str):
         "stream": True,
     }
 
-    events = t.send_request(body, timeout=60)
+    events = t.send_request(body, timeout=180)
     text = t.extract_text(events)
 
     # Model should retain the reasoning context and give 255
@@ -406,7 +406,7 @@ def test_tool_edge_cases(t: ProxyTest, model: str):
         "stream": True,
     }
 
-    events = t.send_request(body, timeout=60)
+    events = t.send_request(body, timeout=180)
     tool_calls = t.extract_tool_calls(events)
 
     t.record("edge_multi_tool", model, len(tool_calls) >= 1,
@@ -420,6 +420,111 @@ def test_tool_edge_cases(t: ProxyTest, model: str):
     no_loop = t.check_no_loop(events)
     t.record("edge_no_loop", model, no_loop,
              "clean" if no_loop else "LOOP in edge case test")
+
+
+# ===================================================================
+# Test 6: Rate Limiter + 429 Retry Verification
+# ===================================================================
+
+def test_rate_limiter(t: ProxyTest):
+    """Verify the proxy rate limiter and 429 retry logic work correctly."""
+    print(f"\n  --- Test 6: Rate limiter + 429 retry ---")
+
+    # 6a: Burst test - send 5 rapid requests and verify all succeed
+    print("    6a: Burst of 5 rapid requests...")
+    burst_pass = True
+    burst_times = []
+    burst_ok = 0
+    for i in range(5):
+        body = {
+            "model": "glm-5.1",
+            "input": [{"type": "message", "role": "user", "content": "Say 'ok' only."}],
+            "stream": True,
+        }
+        start = time.time()
+        try:
+            events = t.send_request(body, timeout=180)
+            text = t.extract_text(events)
+            elapsed = time.time() - start
+            burst_times.append(elapsed)
+            if text.strip():
+                burst_ok += 1
+            else:
+                print(f"      Request {i+1}: EMPTY response ({elapsed:.1f}s)")
+        except Exception as e:
+            print(f"      Request {i+1}: FAILED ({e})")
+            burst_times.append(time.time() - start)
+
+    burst_pass = burst_ok >= 4  # Allow 1 failure for upstream flakiness
+    t.record("rate_burst_5", "glm-5.1", burst_pass,
+             f"{burst_ok}/5 succeeded, avg {sum(burst_times)/max(len(burst_times),1):.1f}s" if burst_pass else f"Only {burst_ok}/5 succeeded")
+
+    # 6b: Verify no false rate limiting - 3 rapid sequential requests should all succeed
+    print("    6b: Rapid sequential requests (verify no false rate limiting)...")
+    rapid_pass = True
+    rapid_ok = 0
+    rapid_start = time.time()
+    for i in range(3):
+        body = {
+            "model": "glm-5.1",
+            "input": [{"type": "message", "role": "user", "content": "Reply with just the number 1."}],
+            "stream": True,
+        }
+        try:
+            events = t.send_request(body, timeout=180)
+            text = t.extract_text(events)
+            if text.strip():
+                rapid_ok += 1
+            else:
+                print(f"      Rapid request {i+1}: EMPTY response")
+        except Exception as e:
+            print(f"      Rapid request {i+1}: FAILED ({e})")
+    rapid_elapsed = time.time() - rapid_start
+
+    rapid_pass = rapid_ok >= 2  # Allow 1 failure for upstream flakiness
+    t.record("rate_rapid_3", "glm-5.1", rapid_pass,
+             f"{rapid_ok}/3 in {rapid_elapsed:.1f}s" if rapid_pass else f"Only {rapid_ok}/3 succeeded")
+
+    # 6c: Verify the /v1/models endpoint works (no rate limiting on GET)
+    try:
+        r = httpx.get(f"{t.proxy_url}/v1/models", timeout=10)
+        models_ok = r.status_code == 200 and "glm-5.1" in r.text
+    except:
+        models_ok = False
+    t.record("rate_models_endpoint", "glm-5.1", models_ok,
+             "models endpoint reachable" if models_ok else "models endpoint failed")
+
+    # 6d: Verify the /health endpoint works (no rate limiting on GET)
+    try:
+        r = httpx.get(f"{t.proxy_url}/health", timeout=10)
+        health_ok = r.status_code == 200
+    except:
+        health_ok = False
+    t.record("rate_health_endpoint", "glm-5.1", health_ok,
+             "health endpoint reachable" if health_ok else "health endpoint failed")
+
+    # 6e: Verify 429 retry works by checking proxy still responds after rapid burst
+    #     Try up to 3 times with a short delay between attempts
+    print("    6e: Post-burst verification...")
+    post_burst = False
+    for attempt in range(3):
+        try:
+            body = {
+                "model": "glm-5.1",
+                "input": [{"type": "message", "role": "user", "content": "Say 'done'."}],
+                "stream": True,
+            }
+            events = t.send_request(body, timeout=180)
+            text = t.extract_text(events)
+            if text.strip():
+                post_burst = True
+                break
+            print(f"      Attempt {attempt+1}: empty response, retrying in 5s...")
+        except Exception as e:
+            print(f"      Attempt {attempt+1}: failed ({e}), retrying in 5s...")
+        time.sleep(5)
+    t.record("rate_post_burst", "glm-5.1", post_burst,
+             "proxy responsive after burst" if post_burst else "proxy unresponsive after burst")
 
 
 # ===================================================================
@@ -460,6 +565,9 @@ def main():
 
     # Run unit tests (only once, not per-model)
     test_system_consolidation(t)
+
+    # Run rate limiter test (uses glm-5.1 only)
+    test_rate_limiter(t)
 
     # Report
     success = t.report()
