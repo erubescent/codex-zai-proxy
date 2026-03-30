@@ -14,6 +14,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from typing import Any
 
 import httpx
@@ -39,6 +40,11 @@ ZAI_MODELS = ["glm-5", "glm-5.1", "glm-4.7"]
 # Loop detection: max identical consecutive chunks before breaking
 LOOP_REPEAT_LIMIT = 5
 
+# Rate limiting: max requests per minute to Z.ai
+ZAI_RPM = int(os.getenv("ZAI_RPM", "50"))
+RETRY_MAX_ATTEMPTS = 3
+import asyncio
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -49,6 +55,32 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("codex-zai-proxy")
+
+# ---------------------------------------------------------------------------
+# Rate Limiter (token bucket)
+# ---------------------------------------------------------------------------
+
+class _RateLimiter:
+    """Simple sliding-window rate limiter for upstream API calls."""
+
+    def __init__(self, max_rpm: int):
+        self.max_rpm = max_rpm
+        self._timestamps: list[float] = []
+
+    async def acquire(self) -> None:
+        now = time.time()
+        # Prune timestamps older than 60s
+        self._timestamps = [t for t in self._timestamps if now - t < 60]
+        if len(self._timestamps) >= self.max_rpm:
+            wait = 60.0 - (now - self._timestamps[0]) + 0.1
+            log.warning("Rate limiter: waiting %.1fs (at %d/%d RPM)", wait, len(self._timestamps), self.max_rpm)
+            await asyncio.sleep(wait)
+            now = time.time()
+            self._timestamps = [t for t in self._timestamps if now - t < 60]
+        self._timestamps.append(time.time())
+
+
+_rate_limiter = _RateLimiter(ZAI_RPM)
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -611,43 +643,55 @@ async def create_response(request: Request):
 
     url = f"{ZAI_BASE_URL}/chat/completions"
 
-    try:
-        upstream = await _http_client.send(
-            _http_client.build_request(
-                "POST",
-                url,
-                json=chat_req,
-                headers=headers,
-            ),
-            stream=True,
-        )
-    except httpx.ConnectError as exc:
-        log.error("Cannot connect to Z.ai: %s", exc)
+    # Acquire rate limiter token before hitting upstream
+    await _rate_limiter.acquire()
+
+    # Forward to Z.ai with retry on 429
+    upstream = None
+    last_status = 0
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 2):  # 1 initial + up to 3 retries
+        try:
+            upstream = await _http_client.send(
+                _http_client.build_request("POST", url, json=chat_req, headers=headers),
+                stream=True,
+            )
+        except httpx.ConnectError as exc:
+            log.error("Cannot connect to Z.ai: %s", exc)
+            return Response(content=json.dumps({"error": "Cannot reach upstream API"}), status_code=502, media_type="application/json")
+        except httpx.TimeoutException:
+            log.error("Upstream request timed out")
+            return Response(content=json.dumps({"error": "Upstream request timed out"}), status_code=504, media_type="application/json")
+
+        last_status = upstream.status_code
+
+        if last_status == 429 and attempt <= RETRY_MAX_ATTEMPTS:
+            retry_after = float(upstream.headers.get("Retry-After", "5"))
+            # Exponential backoff: 5s, 10s, 20s
+            wait = max(retry_after, 2 ** attempt)
+            log.warning("429 rate limited (attempt %d/%d), waiting %.1fs", attempt, RETRY_MAX_ATTEMPTS + 1, wait)
+            await upstream.aclose()
+            await asyncio.sleep(wait)
+            continue
+
+        break  # Non-429 or final attempt
+
+    if last_status == 429:
+        error_body = await upstream.aread() if upstream else b""
+        retry_after = upstream.headers.get("Retry-After", "60") if upstream else "60"
+        log.error("429 exhausted retries, Retry-After: %s", retry_after)
         return Response(
-            content=json.dumps({"error": "Cannot reach upstream API"}),
-            status_code=502,
-            media_type="application/json",
-        )
-    except httpx.TimeoutException:
-        log.error("Upstream request timed out")
-        return Response(
-            content=json.dumps({"error": "Upstream request timed out"}),
-            status_code=504,
+            content=json.dumps({"error": {"message": "Rate limited by upstream API", "type": "rate_limit_error", "code": "429"}}),
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
             media_type="application/json",
         )
 
-    if upstream.status_code != 200:
+    if last_status != 200:
         error_body = await upstream.aread()
-        log.error("Upstream error %d: %s", upstream.status_code, error_body[:500])
+        log.error("Upstream error %d: %s", last_status, error_body[:500])
         return Response(
-            content=json.dumps({
-                "error": {
-                    "message": f"Upstream returned {upstream.status_code}",
-                    "type": "upstream_error",
-                    "code": str(upstream.status_code),
-                }
-            }),
-            status_code=upstream.status_code,
+            content=json.dumps({"error": {"message": f"Upstream returned {last_status}", "type": "upstream_error", "code": str(last_status)}}),
+            status_code=last_status,
             media_type="application/json",
         )
 
